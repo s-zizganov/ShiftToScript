@@ -18,10 +18,14 @@ public class AdvancedRobotDetection {
     private static final long MIN_LOT = 5; // Минимальный размер лота для учёта сделки
     private static final long LOT_TOLERANCE = 0; // Допустимое отклонение лота для "одинаковых" принтов
     private static final long AGGREGATION_WINDOW_MS = 50; // Окно агрегации тиков для снижения шума
+    private static final long ROBOT_TIMEOUT_MS = 180000; // Время "молчания" робота, после которого он считается отключившимся
 
     // Буферы сделок по FIGI: Deque<(timestamp_ms, quantity)>
     private static final Map<String, Deque<long[]>> tradesBuffers = new HashMap<>();
     private static final Map<String, String> figiToTicker = new HashMap<>();
+
+    // Активные роботы: ключ — FIGI + лот
+    private static final Map<String, RobotState> activeRobots = new HashMap<>();
 
     // Формат и часовой пояс для вывода времени обнаружения (МСК)
     private static final ZoneId MOSCOW_ZONE = ZoneId.of("Europe/Moscow");
@@ -128,7 +132,23 @@ public class AdvancedRobotDetection {
         List<Long> tsWindow = timestamps.subList(start, n);
         List<Long> sizesWindow = sizes.subList(start, n);
 
+        // Текущее "логическое" время для этого FIGI — по последнему тику в окне
+        long latestTs = tsWindow.get(tsWindow.size() - 1);
+
         String ticker = figiToTicker.getOrDefault(figi, figi);
+
+        // Сначала очищаем список активных роботов по таймауту ROBOT_TIMEOUT_MS
+        Iterator<Map.Entry<String, RobotState>> it = activeRobots.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, RobotState> entry = it.next();
+            RobotState state = entry.getValue();
+            if (!state.figi.equals(figi)) {
+                continue; // чистим только роботов по текущему FIGI здесь
+            }
+            if (latestTs - state.lastTickMs > ROBOT_TIMEOUT_MS) {
+                it.remove();
+            }
+        }
 
         // Группируем по "почти одинаковым" лотам с допуском LOT_TOLERANCE и ищем стабильные интервалы
         Map<Long, List<Long>> lotBuckets = new HashMap<>();
@@ -150,13 +170,53 @@ public class AdvancedRobotDetection {
             if (tsList.size() < MIN_SERIES_LENGTH) continue;
             Double meanInterval = calculateMeanInterval(tsList);
             if (meanInterval == null) continue;
+
             long intervalSec = Math.round(meanInterval / 1000.0);
-            String detectionTime = java.time.LocalTime.now(MOSCOW_ZONE).format(TIME_FORMATTER);
-            System.out.println("Робот: " + ticker
-                    + " Интервал=" + intervalSec + " секунд, лот≈" + e.getKey()
-                    + " (±" + LOT_TOLERANCE + ")"
-                    + " Время обнаружения (МСК)=" + detectionTime);
+            long lastTickMs = tsList.get(tsList.size() - 1);
+
+            long lot = e.getKey();
+            String robotKey = figi + "|" + lot;
+
+            RobotState state = activeRobots.get(robotKey);
+            if (state == null) {
+                // Новый робот — добавляем в список и логируем один раз
+                state = new RobotState(figi, ticker, lot, intervalSec, lastTickMs);
+                activeRobots.put(robotKey, state);
+
+                String lastTickTimeMsk = Instant.ofEpochMilli(lastTickMs)
+                        .atZone(MOSCOW_ZONE)
+                        .toLocalTime()
+                        .format(TIME_FORMATTER);
+
+                System.out.println("Робот: " + ticker
+                        + " Интервал=" + intervalSec + " секунд, лот≈" + lot
+                        + " (±" + LOT_TOLERANCE + ")"
+                        + " Время последнего тика (МСК)=" + lastTickTimeMsk);
+            } else {
+                // Уже известный робот — просто обновляем время последнего тика и интервал
+                state.lastTickMs = lastTickMs;
+                state.intervalSec = intervalSec;
+            }
             return;
+        }
+    }
+
+    // Состояние "робота" для конкретного FIGI и лота
+    private static class RobotState {
+        final String figi;
+        final String ticker;
+        final long lot;
+        long intervalSec;
+        final long firstDetectedMs;
+        long lastTickMs;
+
+        RobotState(String figi, String ticker, long lot, long intervalSec, long firstDetectedMs) {
+            this.figi = figi;
+            this.ticker = ticker;
+            this.lot = lot;
+            this.intervalSec = intervalSec;
+            this.firstDetectedMs = firstDetectedMs;
+            this.lastTickMs = firstDetectedMs;
         }
     }
 
